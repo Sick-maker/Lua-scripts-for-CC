@@ -1,0 +1,189 @@
+-- probe.lua
+-- One-time, read-only probe for the stackOS design.
+-- Reads the Draconic system (read methods only), samples the FE buffers,
+-- reads your inventory, the environment detectors, peripheral configs
+-- and disk capacity. Writes probe.txt. Nothing is changed.
+--
+-- Before running: be online, wear or carry a backpack and the tool belt.
+
+local OUT = "probe.txt"
+local lines = {}
+local function out(s) lines[#lines + 1] = s or "" end
+
+local function ser(v)
+  local ok, s = pcall(textutils.serialize, v, { compact = true })
+  if not ok then ok, s = pcall(textutils.serialize, v) end
+  return ok and s or tostring(v)
+end
+
+-- Call a method safely and describe whatever comes back
+local function read(name, method, ...)
+  if not peripheral.isPresent(name) then return "MISSING" end
+  local r = table.pack(pcall(peripheral.call, name, method, ...))
+  if not r[1] then return "ERROR: " .. tostring(r[2]) end
+  if r.n == 1 then return "(nothing)" end
+  local parts = {}
+  for i = 2, r.n do parts[#parts + 1] = ser(r[i]) end
+  return table.concat(parts, " | ")
+end
+
+local function line(name, method, ...)
+  out(("  %s.%s = %s"):format(name, method, read(name, method, ...)))
+end
+
+local function dumpTable(prefix, t)
+  local keys = {}
+  for k in pairs(t) do keys[#keys + 1] = k end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  for _, k in ipairs(keys) do
+    out(("  %s.%s = %s"):format(prefix, tostring(k), ser(t[k])))
+  end
+end
+
+term.clear()
+term.setCursorPos(1, 1)
+print("stackOS probe (read-only)")
+
+out("==== STACKOS PROBE ====")
+out(("Computer %d, Minecraft day %d, %s"):format(
+  os.getComputerID(), os.day(), textutils.formatTime(os.time(), false)))
+out("")
+
+-- 1. Disk capacity
+out("== Disk ==")
+local okCap, cap = pcall(fs.getCapacity, "/")
+out(("  computer capacity=%s free=%s"):format(
+  tostring(okCap and cap or "?"), tostring(fs.getFreeSpace("/"))))
+if fs.exists("/disk") then
+  out("  floppy free=" .. tostring(fs.getFreeSpace("/disk")))
+else
+  out("  no floppy in drive_0")
+end
+out("")
+
+-- 2. Draconic, read methods only
+print("Reading the Draconic system...")
+out("== Draconic (read methods only) ==")
+local okInfo, info = pcall(peripheral.call, "draconic_reactor_0", "getReactorInfo")
+if okInfo and type(info) == "table" then
+  dumpTable("reactor", info)
+else
+  out("  getReactorInfo: " .. tostring(info))
+end
+for _, m in ipairs({ "getEnergyStored", "getMaxEnergyStored", "getEnergyStoredInNotation",
+                     "getInputPerTick", "getOutputPerTick", "getTransferPerTick" }) do
+  line("draconic_rf_storage_0", m)
+end
+for _, g in ipairs({ "flow_gate_0", "flow_gate_1" }) do
+  for _, m in ipairs({ "getFlow", "getSignalLowFlow", "getSignalHighFlow", "getOverrideEnabled" }) do
+    line(g, m)
+  end
+end
+out("")
+
+-- 3. FE buffers, all read in the same tick, once a second for 10 seconds
+print("Sampling FE buffers for about 10 seconds...")
+local buffers = {}
+for i = 1, 6 do buffers[#buffers + 1] = "create_new_age:carbon_brushes_" .. i end
+for i = 1, 4 do buffers[#buffers + 1] = "createaddition:large_connector_" .. i end
+for i = 0, 2 do buffers[#buffers + 1] = "create_new_age:reinforced_motor_" .. i end
+
+local samples, times = {}, {}
+for _, n in ipairs(buffers) do samples[n] = {} end
+local start = os.clock()
+for round = 1, 11 do
+  local vals, tasks = {}, {}
+  for _, n in ipairs(buffers) do
+    tasks[#tasks + 1] = function()
+      local ok, e = pcall(peripheral.call, n, "getEnergy")
+      vals[n] = ok and tostring(e) or "x"
+    end
+  end
+  parallel.waitForAll(table.unpack(tasks))
+  times[#times + 1] = ("%.1f"):format(os.clock() - start)
+  for _, n in ipairs(buffers) do table.insert(samples[n], vals[n]) end
+  if round < 11 then sleep(1) end
+end
+out("== FE buffers: getEnergy once a second, then capacity ==")
+out("  times (s): " .. table.concat(times, " "))
+for _, n in ipairs(buffers) do
+  local okc, c = pcall(peripheral.call, n, "getEnergyCapacity")
+  out(("  %s cap=%s : %s"):format(n, okc and tostring(c) or "?", table.concat(samples[n], " ")))
+end
+out("")
+
+-- 4. Your inventory
+print("Reading your inventory...")
+out("== Player (inventoryManager_0) ==")
+for _, m in ipairs({ "getOwner", "getEmptySpace", "isPlayerEquipped",
+                     "getItemInHand", "getItemInOffHand", "getArmor" }) do
+  line("inventoryManager_0", m)
+end
+local okItems, items = pcall(peripheral.call, "inventoryManager_0", "getItems")
+if okItems and type(items) == "table" then
+  local list = {}
+  for _, it in pairs(items) do list[#list + 1] = it end
+  out(("  getItems: %d entries"):format(#list))
+  for i, it in ipairs(list) do
+    if i <= 8 then
+      out("    " .. ser(it))
+    else
+      out(("    %s x%s slot %s"):format(tostring(it.name), tostring(it.count), tostring(it.slot)))
+    end
+  end
+else
+  out("  getItems: " .. tostring(items))
+end
+out("")
+
+-- 5. Environment detectors
+print("Reading environment detectors...")
+out("== Environment ==")
+for i = 0, 2 do
+  local n = "environmentDetector_" .. i
+  for _, m in ipairs({ "getBiome", "getDimension", "getTime", "isRaining", "isThunder",
+                       "isSunny", "getMoonName", "getMoonId", "getDayLightLevel",
+                       "getSkyLightLevel", "getBlockLightLevel", "isSlimeChunk",
+                       "getFuelLevel", "getMaxFuelLevel" }) do
+    line(n, m)
+  end
+  line(n, "scanCost", 8)
+  if i > 0 then
+    local okE, ents = pcall(peripheral.call, n, "scanEntities", 8)
+    if okE and type(ents) == "table" then
+      local list = {}
+      for _, e in pairs(ents) do list[#list + 1] = e end
+      out(("  %s.scanEntities(8): %d entities"):format(n, #list))
+      for j = 1, math.min(8, #list) do out("    " .. ser(list[j])) end
+    else
+      out(("  %s.scanEntities(8): %s"):format(n, tostring(ents)))
+    end
+  end
+end
+out("")
+
+-- 6. Peripheral settings and the rest
+print("Reading configs and odds and ends...")
+out("== Configs ==")
+line("environmentDetector_1", "getConfiguration")
+line("geoScanner_0", "getConfiguration")
+line("inventoryManager_0", "getConfiguration")
+line("redstoneIntegrator_0", "getConfiguration")
+line("nbtStorage_0", "getConfiguration")
+out("")
+out("== Other ==")
+line("geoScanner_0", "getFuelLevel")
+line("geoScanner_0", "cost", 8)
+line("geoScanner_0", "chunkAnalyze")
+line("nbtStorage_0", "read")
+line("printer_1", "getPaperLevel")
+line("printer_1", "getInkLevel")
+line("drive_0", "isDiskPresent")
+line("drive_0", "getDiskLabel")
+
+local f = fs.open(OUT, "w")
+f.write(table.concat(lines, "\n"))
+f.close()
+
+print(("Saved %s (%d lines)."):format(OUT, #lines))
+print("Copy it out the same way as survey.txt.")
