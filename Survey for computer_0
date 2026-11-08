@@ -1,0 +1,219 @@
+-- survey.lua
+-- Read-only survey of everything Computer_0 can see.
+-- Writes survey.txt: every peripheral grouped by type, each type's
+-- methods, and a few harmless readings to check the wiring.
+-- It never calls a method that changes anything, and it calls nothing
+-- at all on the Draconic blocks.
+
+local OUT = "survey.txt"
+
+-- Types that are listed but never called (the read-only rule)
+local HANDS_OFF = {
+  flow_gate = true,
+  draconic_reactor = true,
+  draconic_rf_storage = true,
+}
+
+local lines = {}
+local function out(s) lines[#lines + 1] = s or "" end
+
+-- Natural order: barrel_2 before barrel_10
+local function natKey(s)
+  return (s:gsub("%d+", function(n) return ("%010d"):format(tonumber(n)) end))
+end
+local function natSort(t)
+  table.sort(t, function(a, b) return natKey(a) < natKey(b) end)
+  return t
+end
+
+local function toSet(list)
+  local set = {}
+  for _, v in ipairs(list) do set[v] = true end
+  return set
+end
+
+-- Call a method safely; nil if it doesn't exist or errors
+local function call(p, method, ...)
+  if type(p[method]) ~= "function" then return nil end
+  local ok, a, b = pcall(p[method], ...)
+  if ok then return a, b end
+  return nil
+end
+
+-- Integrators: try relative side names first, then compass names
+local SIDE_SETS = {
+  { "top", "bottom", "left", "right", "front", "back" },
+  { "up", "down", "north", "south", "east", "west" },
+}
+
+local function readIntegrator(p)
+  for _, sides in ipairs(SIDE_SETS) do
+    local lit, worked = {}, true
+    for _, side in ipairs(sides) do
+      local ok, on = pcall(p.getInput, side)
+      if not ok then worked = false break end
+      if on then lit[#lit + 1] = side end
+    end
+    if worked then
+      if #lit == 0 then return "off" end
+      return "ON via " .. table.concat(lit, ", ")
+    end
+  end
+  return "sides unreadable"
+end
+
+local function readInventory(p)
+  local parts = {}
+  local size = call(p, "size")
+  parts[#parts + 1] = "size=" .. tostring(size or "?")
+  local items = call(p, "list")
+  if type(items) == "table" then
+    local used, total, kinds, seen = 0, 0, {}, {}
+    for _, item in pairs(items) do
+      used = used + 1
+      total = total + (item.count or 0)
+      if item.name and not seen[item.name] then
+        seen[item.name] = true
+        kinds[#kinds + 1] = item.name
+      end
+    end
+    parts[#parts + 1] = ("used=%d items=%d"):format(used, total)
+    if #kinds > 0 then
+      table.sort(kinds)
+      local shown = { table.unpack(kinds, 1, math.min(3, #kinds)) }
+      local more = #kinds > 3 and (", +" .. (#kinds - 3) .. " more") or ""
+      parts[#parts + 1] = "[" .. table.concat(shown, ", ") .. more .. "]"
+    end
+  else
+    parts[#parts + 1] = "contents unreadable"
+  end
+  return table.concat(parts, " ")
+end
+
+local function reading(name, mainType, methods)
+  if HANDS_OFF[mainType] then return "not touched (read-only rule)" end
+  local p = peripheral.wrap(name)
+  if not p then return "could not wrap" end
+  local bits = {}
+
+  if mainType == "modem" then
+    bits[#bits + 1] = call(p, "isWireless") and "wireless/ender" or "wired"
+    local localName = call(p, "getNameLocal")
+    if localName then bits[#bits + 1] = "this computer is " .. localName end
+  end
+  if mainType == "redstoneIntegrator" or mainType == "redstone_relay" then
+    bits[#bits + 1] = readIntegrator(p)
+  end
+  if peripheral.hasType(name, "inventory") then
+    bits[#bits + 1] = readInventory(p)
+  end
+  if mainType == "monitor" then
+    local w, h = call(p, "getSize")
+    if w then
+      bits[#bits + 1] = ("%dx%d chars at scale %s"):format(w, h, tostring(call(p, "getTextScale")))
+    end
+  end
+  if methods.getTransferRate then
+    local r = call(p, "getTransferRate")
+    if r then bits[#bits + 1] = "rate=" .. tostring(r) .. " FE/t" end
+  end
+  if methods.getSpeed then
+    local s = call(p, "getSpeed")
+    if s then bits[#bits + 1] = "speed=" .. tostring(s) .. " rpm" end
+  end
+  if methods.getStress and methods.getStressCapacity then
+    local s = call(p, "getStress")
+    local c = call(p, "getStressCapacity")
+    if s then bits[#bits + 1] = ("stress=%s/%s su"):format(tostring(s), tostring(c)) end
+  end
+  return table.concat(bits, "  ")
+end
+
+-- Gather every peripheral and group by its main type
+term.clear()
+term.setCursorPos(1, 1)
+print("Network survey (read-only)")
+
+local names = natSort(peripheral.getNames())
+print(("Found %d peripherals."):format(#names))
+
+local groups, order = {}, {}
+for _, name in ipairs(names) do
+  local types = { peripheral.getType(name) }
+  local main = types[1] or "unknown"
+  local g = groups[main]
+  if not g then
+    local methods = peripheral.getMethods(name) or {}
+    table.sort(methods)
+    g = { names = {}, also = {}, methods = methods, set = toSet(methods) }
+    for i = 2, #types do g.also[#g.also + 1] = types[i] end
+    groups[main] = g
+    order[#order + 1] = main
+  end
+  g.names[#g.names + 1] = name
+end
+natSort(order)
+
+-- Take readings, showing progress on one line
+local readings, done = {}, 0
+local width = term.getSize()
+local _, y = term.getCursorPos()
+for _, main in ipairs(order) do
+  local g = groups[main]
+  for _, name in ipairs(g.names) do
+    readings[name] = reading(name, main, g.set)
+    done = done + 1
+    term.setCursorPos(1, y)
+    term.clearLine()
+    write((("Reading %d/%d  %s"):format(done, #names, name)):sub(1, width))
+  end
+end
+print()
+
+-- Build the report
+local label = os.getComputerLabel()
+out("==== NETWORK SURVEY ====")
+out(("Computer ID %d%s, Minecraft day %d, %s"):format(
+  os.getComputerID(), label and (' "' .. label .. '"') or "",
+  os.day(), textutils.formatTime(os.time(), false)))
+out(("%d peripherals in %d types. Readings are a snapshot; nothing was changed."):format(#names, #order))
+out("")
+out("== Directly attached to this computer ==")
+for _, side in ipairs(rs.getSides()) do
+  out(("  %-6s %s"):format(side, peripheral.getType(side) or "-"))
+end
+out("")
+out("== Counts by type ==")
+for _, main in ipairs(order) do
+  out(("  %4d  %s"):format(#groups[main].names, main))
+end
+
+for _, main in ipairs(order) do
+  local g = groups[main]
+  out("")
+  local also = #g.also > 0 and ("  also: " .. table.concat(g.also, ", ")) or ""
+  out(("== %s (%d)%s"):format(main, #g.names, also))
+  out("methods: " .. (#g.methods > 0 and table.concat(g.methods, ", ") or "none"))
+  for _, name in ipairs(g.names) do
+    local r = readings[name]
+    out("  " .. name .. ((r and r ~= "") and ("   " .. r) or ""))
+  end
+end
+
+local f = fs.open(OUT, "w")
+f.write(table.concat(lines, "\n"))
+f.close()
+
+-- Short summary on screen
+print(("Saved %s (%d lines)."):format(OUT, #lines))
+print(("World folder: saves/<your world>/computercraft/computer/%d/%s"):format(os.getComputerID(), OUT))
+
+if http then
+  write("Upload to pastebin for easy copying? (y/n) ")
+  local answer = read()
+  if answer and answer:lower():sub(1, 1) == "y" then
+    shell.run("pastebin", "put", OUT)
+  end
+else
+  print("HTTP is off here, so copy the file from the world folder.")
+end
