@@ -1,0 +1,662 @@
+-- reactortest.lua  v1.0
+-- stackOS research tool. FOR A TEST WORLD ONLY.
+--
+-- Records a Draconic Evolution reactor exactly as a computer sees it, so
+-- stackOS can be built on real data. It is strictly read-only: it never
+-- activates, charges, stops or fail-safes the reactor, and never touches a
+-- flow gate. Any attempt to call anything but a read method is refused.
+--
+-- Mode 1, normal:  a baseline from cold through warm-up, running, filling the
+--                  energy core, and the idle after the core is full.
+-- Mode 2, oh-shit: every game tick, from before activation until the reactor
+--                  stops answering for 30 seconds or you press Q.
+--
+-- Output, in /reactorlogs/ on this computer:
+--   <mode>_raw.log     every reading, written as it happens (survives a freeze)
+--   <mode>_digest.txt  a summary sized for pasting, rewritten every few seconds
+--
+-- Keys while running:  M = drop a numbered marker   D = write the digest now
+--                      Q = finish
+-- Usage: reactortest              (menu)
+--        reactortest normal | reactortest ohshit
+
+local ARG = ...
+local VERSION = "1.0"
+local DIR = "/reactorlogs"
+
+local PROFILES = {
+  normal = { interval = 1, heartbeat = 10, aux = 5,   digest = 30, down = 30, ring = 60 },
+  ohshit = { interval = 0, heartbeat = 0,  aux = 0.5, digest = 5,  down = 1,  ring = 200 },
+}
+local REDUCE_AT = 150000   -- bytes free: start thinning the raw log
+local STOP_AT = 80000      -- bytes free: stop the raw log, keep the digest
+local DOWN_MAX = 600       -- longest the sampled table may grow before thinning
+
+local KNOWN = { "status", "temperature", "fieldStrength", "maxFieldStrength",
+  "energySaturation", "maxEnergySaturation", "fuelConversion", "maxFuelConversion",
+  "generationRate", "fieldDrainRate", "fuelConversionRate", "failSafe" }
+local KNOWNSET = {}
+for _, k in ipairs(KNOWN) do KNOWNSET[k] = true end
+
+-- The only methods this program may call. Anything else is refused.
+local READS = {
+  draconic_reactor = { getReactorInfo = true },
+  draconic_rf_storage = { getEnergyStored = true, getMaxEnergyStored = true,
+    getInputPerTick = true, getOutputPerTick = true, getTransferPerTick = true },
+  flow_gate = { getFlow = true, getSignalLowFlow = true, getSignalHighFlow = true,
+    getOverrideEnabled = true },
+}
+
+local function pread(name, ptype, method)
+  if not (READS[ptype] and READS[ptype][method]) then
+    error("refusing to call " .. tostring(method) .. ": not a read method", 2)
+  end
+  if not peripheral.isPresent(name) then return nil, "not present" end
+  local ok, v = pcall(peripheral.call, name, method)
+  if not ok then return nil, tostring(v) end
+  return v
+end
+
+local function findAll(ptype)
+  local out = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.hasType(n, ptype) then out[#out + 1] = n end
+  end
+  table.sort(out)
+  return out
+end
+
+-- ---------- formatting ----------
+
+local function fmt(v)
+  local tv = type(v)
+  if tv == "number" then
+    if v == math.floor(v) and math.abs(v) < 1e15 then return string.format("%d", v) end
+    return string.format("%.9g", v)
+  elseif tv == "string" then
+    return (v:gsub("%s", "_"))
+  elseif tv == "table" then
+    local ok, s = pcall(textutils.serialize, v, { compact = true })
+    return ok and (s:gsub("%s", "")) or "<table>"
+  end
+  return tostring(v)
+end
+
+local function num(v, dec)
+  if type(v) ~= "number" then return "-" end
+  return string.format("%." .. (dec or 1) .. "f", v)
+end
+
+local function big(v)
+  if type(v) ~= "number" then return "-" end
+  local a = math.abs(v)
+  if a >= 1e12 then return string.format("%.2fT", v / 1e12) end
+  if a >= 1e9 then return string.format("%.2fG", v / 1e9) end
+  if a >= 1e6 then return string.format("%.2fM", v / 1e6) end
+  if a >= 1e3 then return string.format("%.1fk", v / 1e3) end
+  return string.format("%.0f", v)
+end
+
+local function pct(a, b)
+  if type(a) == "number" and type(b) == "number" and b > 0 then return a / b * 100 end
+end
+
+-- ---------- state ----------
+
+local S = {
+  samples = 0, rawLines = 0, rawSkip = 0, reduced = false, rawStopped = false,
+  keys = {}, timeline = {}, events = {}, eventCount = 0,
+  stats = {}, statusOrder = {}, crossed = {}, crossings = {},
+  down = {}, lastDown = -1e9, ring = {},
+  lastLoggedT = -1e9, maxField = 0, escalated = false,
+  gates = {}, gateStats = {}, cores = {}, coreStats = {},
+  markers = 0, free = 0, finished = false,
+}
+
+local function now() return (os.epoch("utc") - S.t0) / 1000 end
+local function gameTick() return math.floor(os.epoch("ingame") / 3600) end
+
+local function rawWrite(line, force)
+  if S.rawStopped or not S.raw then return end
+  S.raw.writeLine(line)
+  S.rawLines = S.rawLines + 1
+  if force or S.mode == "ohshit" or S.escalated or S.rawLines % 10 == 0 then S.raw.flush() end
+end
+
+local function event(msg)
+  S.eventCount = S.eventCount + 1
+  local line = ("E t=%.3f tick=%d %s"):format(now(), gameTick(), msg)
+  S.events[#S.events + 1] = line
+  if #S.events > 300 then table.remove(S.events, 1) end
+  rawWrite(line, true)
+  S.lastEvent = msg
+end
+
+-- ---------- reactor readings ----------
+
+local TRACK = { "temperature", "field%", "sat%", "fuel%",
+  "generationRate", "fieldDrainRate", "fuelConversionRate" }
+
+local function derive(info)
+  return {
+    temperature = info.temperature,
+    ["field%"] = pct(info.fieldStrength, info.maxFieldStrength),
+    ["sat%"] = pct(info.energySaturation, info.maxEnergySaturation),
+    ["fuel%"] = pct(info.fuelConversion, info.maxFuelConversion),
+    generationRate = info.generationRate,
+    fieldDrainRate = info.fieldDrainRate,
+    fuelConversionRate = info.fuelConversionRate,
+  }
+end
+
+local function addStats(status, d, dt)
+  local s = S.stats[status]
+  if not s then
+    s = { dur = 0, n = 0, f = {} }
+    S.stats[status] = s
+    S.statusOrder[#S.statusOrder + 1] = status
+  end
+  s.dur = s.dur + dt
+  s.n = s.n + 1
+  for _, k in ipairs(TRACK) do
+    local v = d[k]
+    if type(v) == "number" then
+      local f = s.f[k]
+      if not f then f = { min = v, max = v, first = v, last = v }; s.f[k] = f end
+      if v < f.min then f.min = v end
+      if v > f.max then f.max = v end
+      f.last = v
+    end
+  end
+end
+
+local CROSSINGS = {
+  { "temperature above 7500 C",  function(d) return (d.temperature or 0) > 7500 end },
+  { "temperature above 8000 C",  function(d) return (d.temperature or 0) > 8000 end },
+  { "temperature above 9000 C",  function(d) return (d.temperature or 0) > 9000 end },
+  { "temperature above 10000 C", function(d) return (d.temperature or 0) > 10000 end },
+  { "containment below 40% after being above 50%", function(d) return S.maxField > 50 and (d["field%"] or 100) < 40 end },
+  { "containment below 25% after being above 50%", function(d) return S.maxField > 50 and (d["field%"] or 100) < 25 end },
+  { "containment below 10% after being above 50%", function(d) return S.maxField > 50 and (d["field%"] or 100) < 10 end },
+  { "containment at 0 after being above 50%",      function(d) return S.maxField > 50 and (d["field%"] or 100) <= 0 end },
+  { "saturation below 10% while not cold", function(d, st) return st ~= "cold" and (d["sat%"] or 100) < 10 end },
+  { "fuel used above 80%", function(d) return (d["fuel%"] or 0) > 80 end },
+  { "fuel used above 90%", function(d) return (d["fuel%"] or 0) > 90 end },
+}
+
+local function sortedFields(info)
+  local list = {}
+  for k, v in pairs(info) do list[#list + 1] = { tostring(k), v } end
+  table.sort(list, function(a, b) return a[1] < b[1] end)
+  return list
+end
+
+local function reactorLine(t, tick, info)
+  local parts = { ("R t=%.3f tick=%d"):format(t, tick) }
+  for _, k in ipairs(KNOWN) do
+    if info[k] ~= nil then parts[#parts + 1] = k .. "=" .. fmt(info[k]) end
+  end
+  for _, kv in ipairs(sortedFields(info)) do
+    if not KNOWNSET[kv[1]] then parts[#parts + 1] = kv[1] .. "=" .. fmt(kv[2]) end
+  end
+  return table.concat(parts, " ")
+end
+
+local SUMMARY_HEAD = ("%9s %9s %-12s %8s %6s %6s %7s %9s %9s %6s %s"):format(
+  "t(s)", "tick", "status", "temp", "field%", "sat%", "fuel%", "gen", "drain", "fuelR", "failSafe")
+
+local function summary(t, tick, info, d)
+  local extra = {}
+  for _, kv in ipairs(sortedFields(info)) do
+    if not KNOWNSET[kv[1]] then extra[#extra + 1] = kv[1] .. "=" .. fmt(kv[2]) end
+  end
+  return ("%9.2f %9d %-12s %8s %6s %6s %7s %9s %9s %6s %s%s"):format(
+    t, tick, tostring(info.status), num(d.temperature, 1), num(d["field%"], 2),
+    num(d["sat%"], 2), num(d["fuel%"], 3), big(d.generationRate), big(d.fieldDrainRate),
+    num(d.fuelConversionRate, 0), tostring(info.failSafe),
+    #extra > 0 and (" " .. table.concat(extra, " ")) or "")
+end
+
+local function changed(d, ld)
+  if not ld then return true end
+  local tol = { temperature = 1, ["field%"] = 0.1, ["sat%"] = 0.1, ["fuel%"] = 0.01 }
+  for _, k in ipairs(TRACK) do
+    local a, b = d[k], ld[k]
+    if type(a) ~= type(b) then return true end
+    if type(a) == "number" then
+      local limit = tol[k] or math.max(1, math.abs(b) * 0.005)
+      if math.abs(a - b) > limit then return true end
+    end
+  end
+  return false
+end
+
+local function handleSample(t, tick, info)
+  S.samples = S.samples + 1
+  local status = tostring(info.status)
+  local d = derive(info)
+  local dt = S.prevT and (t - S.prevT) or 0
+  S.prevT = t
+
+  local statusChanged = status ~= S.lastStatus
+  if statusChanged then
+    event(("STATUS %s -> %s"):format(tostring(S.lastStatus), status))
+    S.timeline[#S.timeline + 1] = ("%9.2f s  tick %d  %s"):format(t, tick, status)
+    S.lastStatus = status
+  end
+
+  -- Fields that appear or disappear
+  local present = {}
+  for _, kv in ipairs(sortedFields(info)) do
+    present[kv[1]] = true
+    if not S.keys[kv[1]] then
+      S.keys[kv[1]] = true
+      if S.samples > 1 then event(("NEW FIELD %s=%s"):format(kv[1], fmt(kv[2]))) end
+    end
+  end
+  if S.lastKeys then
+    for k in pairs(S.lastKeys) do
+      if not present[k] then event("FIELD GONE " .. k) end
+    end
+  end
+  S.lastKeys = present
+
+  if S.last and S.last.failSafe ~= info.failSafe then
+    event(("FAILSAFE %s -> %s"):format(tostring(S.last.failSafe), tostring(info.failSafe)))
+  end
+
+  addStats(status, d, dt)
+  if (d["field%"] or 0) > S.maxField then S.maxField = d["field%"] end
+
+  for _, c in ipairs(CROSSINGS) do
+    if not S.crossed[c[1]] and c[2](d, status) then
+      S.crossed[c[1]] = true
+      S.crossings[#S.crossings + 1] = ("%9.2f s  tick %d  %-12s %s"):format(t, tick, status, c[1])
+      event("CROSSED " .. c[1])
+    end
+  end
+
+  -- A normal run that starts to look dangerous switches to per-tick recording
+  if S.mode == "normal" and not S.escalated then
+    if (d.temperature or 0) > 8500 or (S.maxField > 50 and (d["field%"] or 100) < 15) then
+      S.escalated = true
+      S.cfg = PROFILES.ohshit
+      S.downEvery = 1
+      event("ESCALATED: danger signs, now recording every tick")
+    end
+  end
+
+  -- Raw log: every reading at full rate, otherwise only on change or heartbeat
+  local want
+  if S.cfg.interval == 0 then
+    want = true
+  else
+    want = statusChanged or (t - S.lastLoggedT >= S.cfg.heartbeat) or changed(d, S.lastLoggedD)
+  end
+  if want and S.reduced and not statusChanged then
+    S.rawSkip = S.rawSkip + 1
+    want = (S.rawSkip % 10 == 0)
+  end
+  if want then
+    rawWrite(reactorLine(t, tick, info))
+    S.lastLoggedT = t
+    S.lastLoggedD = d
+  end
+
+  -- Digest material
+  local sline = summary(t, tick, info, d)
+  S.ring[#S.ring + 1] = sline
+  while #S.ring > S.cfg.ring do table.remove(S.ring, 1) end
+  if statusChanged or t - S.lastDown >= S.downEvery then
+    S.down[#S.down + 1] = sline
+    S.lastDown = t
+    if #S.down > DOWN_MAX then
+      local kept = {}
+      for i = 1, #S.down, 2 do kept[#kept + 1] = S.down[i] end
+      S.down = kept
+      S.downEvery = S.downEvery * 2
+    end
+  end
+
+  S.last = info
+  S.lastD = d
+end
+
+-- ---------- flow gates and energy cores ----------
+
+local function sampleAux()
+  local parts = { ("A t=%.3f tick=%d"):format(now(), gameTick()) }
+  for _, g in ipairs(S.gateNames) do
+    local flow = pread(g, "flow_gate", "getFlow")
+    local lo = pread(g, "flow_gate", "getSignalLowFlow")
+    local hi = pread(g, "flow_gate", "getSignalHighFlow")
+    local ov = pread(g, "flow_gate", "getOverrideEnabled")
+    parts[#parts + 1] = ("%s flow=%s low=%s high=%s override=%s"):format(g, fmt(flow), fmt(lo), fmt(hi), fmt(ov))
+    local setting = fmt(lo) .. "/" .. fmt(hi) .. "/" .. fmt(ov)
+    local prev = S.gates[g]
+    if not prev or prev.setting ~= setting then
+      event(("GATE %s %s low=%s high=%s override=%s"):format(g, prev and "changed" or "initial",
+        fmt(lo), fmt(hi), fmt(ov)))
+    end
+    S.gates[g] = { flow = flow, low = lo, high = hi, override = ov, setting = setting }
+    local gs = S.gateStats[g] or {}
+    if type(flow) == "number" then
+      gs.min = math.min(gs.min or flow, flow)
+      gs.max = math.max(gs.max or flow, flow)
+    end
+    S.gateStats[g] = gs
+  end
+  for _, c in ipairs(S.coreNames) do
+    local st = pread(c, "draconic_rf_storage", "getEnergyStored")
+    local mx = pread(c, "draconic_rf_storage", "getMaxEnergyStored")
+    local inp = pread(c, "draconic_rf_storage", "getInputPerTick")
+    local out = pread(c, "draconic_rf_storage", "getOutputPerTick")
+    local tr = pread(c, "draconic_rf_storage", "getTransferPerTick")
+    parts[#parts + 1] = ("%s stored=%s max=%s in=%s out=%s transfer=%s"):format(
+      c, fmt(st), fmt(mx), fmt(inp), fmt(out), fmt(tr))
+    S.cores[c] = { stored = st, max = mx, input = inp, output = out, transfer = tr }
+    local cs = S.coreStats[c] or {}
+    if type(st) == "number" then
+      cs.first = cs.first or st
+      cs.last = st
+      cs.min = math.min(cs.min or st, st)
+      cs.max = math.max(cs.max or st, st)
+    end
+    if type(inp) == "number" then cs.maxIn = math.max(cs.maxIn or inp, inp) end
+    if type(out) == "number" then cs.maxOut = math.max(cs.maxOut or out, out) end
+    S.coreStats[c] = cs
+  end
+  rawWrite(table.concat(parts, " | "))
+end
+
+-- ---------- disk and digest ----------
+
+local function checkDisk()
+  S.free = fs.getFreeSpace(DIR)
+  if not S.reduced and S.free < REDUCE_AT then
+    event(("LOW DISK (%d bytes free): raw log keeps every 10th reading from now on"):format(S.free))
+    S.reduced = true
+  end
+  if not S.rawStopped and S.free < STOP_AT then
+    event(("DISK NEARLY FULL (%d bytes free): raw log stopped; the digest carries on"):format(S.free))
+    if S.raw then S.raw.flush() end
+    S.rawStopped = true
+  end
+end
+
+local function writeDigest(final)
+  local L = {}
+  local function o(s) L[#L + 1] = s or "" end
+  o(("==== REACTOR TEST DIGEST: %s ===="):format(S.mode == "normal" and "NORMAL OPERATIONS" or "OH-SHIT MODE"))
+  o(("reactortest %s | started %s | %.1f s | %d reactor readings | %d raw lines | %s"):format(
+    VERSION, S.startDate, now(), S.samples, S.rawLines,
+    final and ("FINAL: " .. tostring(S.finishReason)) or "in progress"))
+  if S.escalated then o("This normal run escalated to per-tick recording.") end
+  if S.reduced then o("The disk ran low, so the raw log was thinned or stopped.") end
+  o(("devices: reactor=%s | cores=%s | gates=%s"):format(S.reactorName,
+    table.concat(S.coreNames, ","), table.concat(S.gateNames, ",")))
+  o("reactor methods: " .. S.reactorMethods)
+  local ks = {}
+  for k in pairs(S.keys) do ks[#ks + 1] = KNOWNSET[k] and k or (k .. "(NEW)") end
+  table.sort(ks)
+  o("fields seen: " .. table.concat(ks, ", "))
+  o("")
+  o("== Status timeline ==")
+  for _, l in ipairs(S.timeline) do o(l) end
+  o("")
+  o("== By status: min / max / first / last ==")
+  for _, st in ipairs(S.statusOrder) do
+    local s = S.stats[st]
+    o(("%s: %.1f s, %d readings"):format(st, s.dur, s.n))
+    for _, k in ipairs(TRACK) do
+      local f = s.f[k]
+      if f then
+        o(("  %-18s %s / %s / %s / %s"):format(k, fmt(f.min), fmt(f.max), fmt(f.first), fmt(f.last)))
+      end
+    end
+  end
+  o("")
+  o("== First crossings ==")
+  if #S.crossings == 0 then o("none") end
+  for _, l in ipairs(S.crossings) do o(l) end
+  o("")
+  o("== Flow gates ==")
+  for _, g in ipairs(S.gateNames) do
+    local c, gs = S.gates[g] or {}, S.gateStats[g] or {}
+    o(("%s now flow=%s low=%s high=%s override=%s | flow ranged %s to %s"):format(
+      g, fmt(c.flow), fmt(c.low), fmt(c.high), fmt(c.override), fmt(gs.min), fmt(gs.max)))
+  end
+  o("")
+  o("== Energy cores ==")
+  for _, c in ipairs(S.coreNames) do
+    local cs, cur = S.coreStats[c] or {}, S.cores[c] or {}
+    o(("%s stored first=%s last=%s min=%s max=%s of %s | peak in %s/t | peak out %s/t"):format(
+      c, big(cs.first), big(cs.last), big(cs.min), big(cs.max), big(cur.max), big(cs.maxIn), big(cs.maxOut)))
+  end
+  o("")
+  o(("== Events (%d in all, last %d shown) =="):format(S.eventCount, #S.events))
+  for _, l in ipairs(S.events) do o(l) end
+  o("")
+  o(("== Readings, about every %s s, plus every status change =="):format(fmt(S.downEvery)))
+  o(SUMMARY_HEAD)
+  for _, l in ipairs(S.down) do o(l) end
+  o("")
+  o(("== Last %d readings at full rate =="):format(#S.ring))
+  o(SUMMARY_HEAD)
+  for _, l in ipairs(S.ring) do o(l) end
+  local f = fs.open(S.digestPath, "w")
+  if f then
+    f.write(table.concat(L, "\n"))
+    f.close()
+  end
+end
+
+-- ---------- screen ----------
+
+local function draw()
+  local w, h = term.getSize()
+  local y = 1
+  local function line(s, col)
+    term.setCursorPos(1, y)
+    term.clearLine()
+    term.setTextColour(col or colours.white)
+    term.write(s:sub(1, w))
+    y = y + 1
+  end
+  local d, info = S.lastD or {}, S.last or {}
+  line(("reactortest %s  %s%s"):format(VERSION, S.mode == "normal" and "NORMAL" or "OH-SHIT",
+    S.escalated and " (escalated)" or ""), colours.yellow)
+  line(("elapsed %.0f s  readings %d  raw lines %d"):format(now(), S.samples, S.rawLines))
+  line(("status %s   failSafe %s"):format(tostring(info.status), tostring(info.failSafe)), colours.lightBlue)
+  line(("temp %s C  field %s%%  sat %s%%"):format(num(d.temperature, 1), num(d["field%"], 2), num(d["sat%"], 2)))
+  line(("fuel used %s%%  fuel rate %s"):format(num(d["fuel%"], 3), num(d.fuelConversionRate, 0)))
+  line(("generation %s/t  drain %s/t"):format(big(d.generationRate), big(d.fieldDrainRate)))
+  for _, g in ipairs(S.gateNames) do
+    local c = S.gates[g] or {}
+    line(("%s %s (low %s high %s)"):format(g, big(c.flow), big(c.low), big(c.high)))
+  end
+  for _, c in ipairs(S.coreNames) do
+    local cc = S.cores[c] or {}
+    line(("%s %s of %s"):format(c, big(cc.stored), big(cc.max)))
+  end
+  line(("disk free %s bytes%s"):format(tostring(S.free),
+    S.rawStopped and "  RAW STOPPED" or (S.reduced and "  RAW THINNED" or "")))
+  line("last: " .. tostring(S.lastEvent or "-"), colours.orange)
+  if S.missingSince then
+    line(("REACTOR NOT ANSWERING for %.0f s"):format(now() - S.missingSince), colours.red)
+  end
+  while y < h do line("") end
+  y = h
+  line(("[M] marker %d  [D] digest  [Q] finish"):format(S.markers), colours.lightGrey)
+end
+
+-- ---------- loops ----------
+
+local function reactorLoop()
+  local lastTick = -1
+  while not S.finished do
+    local tick = gameTick()
+    if S.cfg.interval == 0 and tick == lastTick then
+      sleep(0.05)
+    else
+      lastTick = tick
+      local t = now()
+      local info, err = pread(S.reactorName, "draconic_reactor", "getReactorInfo")
+      if type(info) == "table" then
+        if S.missingSince then
+          event(("REACTOR ANSWERING AGAIN after %.1f s"):format(t - S.missingSince))
+          S.missingSince = nil
+        end
+        handleSample(t, tick, info)
+      else
+        if not S.missingSince then
+          S.missingSince = t
+          event("REACTOR NOT ANSWERING: " .. tostring(err))
+          writeDigest(false)
+        elseif S.mode == "ohshit" and t - S.missingSince >= 30 then
+          S.finishReason = "the reactor stopped answering for 30 s"
+          S.finished = true
+        end
+        sleep(0.05)
+      end
+      if S.cfg.interval > 0 and not S.finished then sleep(S.cfg.interval) end
+    end
+  end
+end
+
+local function auxLoop()
+  while not S.finished do
+    sampleAux()
+    sleep(S.cfg.aux)
+  end
+end
+
+local function digestLoop()
+  while not S.finished do
+    sleep(S.cfg.digest)
+    checkDisk()
+    writeDigest(false)
+  end
+end
+
+local function displayLoop()
+  while not S.finished do
+    draw()
+    sleep(0.25)
+  end
+end
+
+local function keyLoop()
+  while not S.finished do
+    local _, ch = os.pullEvent("char")
+    ch = ch:lower()
+    if ch == "m" then
+      S.markers = S.markers + 1
+      event(("MARKER %d"):format(S.markers))
+    elseif ch == "d" then
+      writeDigest(false)
+      S.lastEvent = "digest written"
+    elseif ch == "q" then
+      S.finishReason = "stopped by you"
+      S.finished = true
+    end
+  end
+end
+
+-- ---------- start ----------
+
+local function chooseMode()
+  if ARG == "normal" or ARG == "1" then return "normal" end
+  if ARG == "ohshit" or ARG == "2" then return "ohshit" end
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("reactortest " .. VERSION .. "  (read-only, test worlds only)")
+  print("")
+  print("1  Normal operations baseline")
+  print("2  Oh-shit mode: every tick until the reactor is gone")
+  print("")
+  write("Choose 1 or 2: ")
+  local a = read()
+  if a == "1" then return "normal" elseif a == "2" then return "ohshit" end
+end
+
+local function freeName(base, ext)
+  local n = 1
+  while fs.exists(fs.combine(DIR, ("%s_%d.%s"):format(base, n, ext))) do n = n + 1 end
+  return fs.combine(DIR, ("%s_%d.%s"):format(base, n, ext))
+end
+
+local function main()
+  S.reactorName = findAll("draconic_reactor")[1]
+  S.coreNames = findAll("draconic_rf_storage")
+  S.gateNames = findAll("flow_gate")
+  if not S.reactorName then
+    printError("No draconic_reactor found. Put a wired modem on a reactor stabilizer,")
+    printError("right-click it to connect, and link it to this computer.")
+    return
+  end
+
+  local mode = chooseMode()
+  if not mode then print("Nothing chosen.") return end
+  S.mode = mode
+  S.cfg = PROFILES[mode]
+  S.downEvery = S.cfg.down
+
+  local okCap, cap = pcall(fs.getCapacity, "/")
+  if okCap and type(cap) == "number" and cap < 5000000 then
+    print("")
+    printError(("This computer has only %d bytes of disk."):format(cap))
+    print("For full logs, raise computer_space_limit in this test")
+    print("world's serverconfig/computercraft-server.toml.")
+    write("Continue anyway? (y/n) ")
+    if (read() or ""):lower():sub(1, 1) ~= "y" then return end
+  end
+
+  if not fs.exists(DIR) then fs.makeDir(DIR) end
+  S.rawPath = fs.combine(DIR, mode .. "_raw.log")
+  S.digestPath = fs.combine(DIR, mode .. "_digest.txt")
+  if fs.exists(S.rawPath) then fs.move(S.rawPath, freeName(mode .. "_raw", "log")) end
+  if fs.exists(S.digestPath) then fs.move(S.digestPath, freeName(mode .. "_digest", "txt")) end
+
+  S.raw = fs.open(S.rawPath, "w")
+  S.t0 = os.epoch("utc")
+  S.startDate = os.date("!%Y-%m-%d %H:%M:%S UTC")
+  local okM, methods = pcall(peripheral.getMethods, S.reactorName)
+  S.reactorMethods = okM and table.concat(methods or {}, ",") or "?"
+
+  rawWrite(("# reactortest %s, mode %s, started %s, game day %d"):format(VERSION, mode, S.startDate, os.day()), true)
+  rawWrite("# R = reactor reading, A = flow gates and cores, E = event. t = seconds since start, tick = game tick.", true)
+  rawWrite(("# reactor %s | cores %s | gates %s"):format(S.reactorName,
+    table.concat(S.coreNames, ","), table.concat(S.gateNames, ",")), true)
+  rawWrite("# reactor methods: " .. S.reactorMethods, true)
+  for _, n in ipairs(S.gateNames) do
+    local ok, m = pcall(peripheral.getMethods, n)
+    rawWrite(("# %s methods: %s"):format(n, ok and table.concat(m or {}, ",") or "?"), true)
+  end
+  for _, n in ipairs(S.coreNames) do
+    local ok, m = pcall(peripheral.getMethods, n)
+    rawWrite(("# %s methods: %s"):format(n, ok and table.concat(m or {}, ",") or "?"), true)
+  end
+
+  checkDisk()
+  event("START " .. mode)
+  term.clear()
+  local ok, err = pcall(parallel.waitForAny, reactorLoop, auxLoop, digestLoop, displayLoop, keyLoop)
+  if not ok then
+    S.finishReason = "program stopped: " .. tostring(err)
+  end
+  S.finished = true
+  event("FINISH " .. tostring(S.finishReason))
+  writeDigest(true)
+  if S.raw then S.raw.close() end
+
+  term.setTextColour(colours.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Finished: " .. tostring(S.finishReason))
+  print("Digest:  " .. S.digestPath)
+  print("Raw log: " .. S.rawPath)
+  print(("Computer ID %d"):format(os.getComputerID()))
+end
+
+main()
