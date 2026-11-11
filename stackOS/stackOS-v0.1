@@ -1,0 +1,7 @@
+-- stackOS-v0.1: the one command. Loads every stackOS module and hands over to the monitors.
+package.path = "/stackos/?.lua;/stackos/?/init.lua;" .. package.path
+local ok, err = pcall(function() require("kernel.boot").run() end)
+if not ok then
+  printError("stackOS failed to start:")
+  printError(tostring(err))
+end

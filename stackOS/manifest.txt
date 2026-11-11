@@ -1,0 +1,23 @@
+# stackOS 0.1 file list, read by stackos-install
+stackOS-v0.1
+stackos/data/registry.lua
+stackos/kernel/boot.lua
+stackos/kernel/console.lua
+stackos/kernel/log.lua
+stackos/kernel/sched.lua
+stackos/kernel/store.lua
+stackos/layers/home.lua
+stackos/layers/settings.lua
+stackos/layers/splash.lua
+stackos/layers/switchboard.lua
+stackos/layers/system.lua
+stackos/services/devices.lua
+stackos/services/integrators.lua
+stackos/ui/canvas.lua
+stackos/ui/chrome.lua
+stackos/ui/palettes.lua
+stackos/ui/session.lua
+stackos/ui/theme.lua
+stackos/ui/ui.lua
+stackos/ui/widgets.lua
+stackos/version.lua
